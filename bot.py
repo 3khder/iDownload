@@ -1,7 +1,7 @@
 import os
-import re
-import ssl
 import json
+import tempfile
+import urllib.parse
 import urllib.request
 import telebot
 from telebot import types
@@ -20,221 +20,186 @@ TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("لم يتم العثور على BOT_TOKEN، تأكد من ضبطه في إعدادات السيرفر.")
 
-bot = telebot.TeleBot(TOKEN)
-user_links = {}
+# تشغيل البوت بعدد خيوط معالجة أعلى للتعامل مع الطلبات المتزامنة
+bot = telebot.TeleBot(TOKEN, num_threads=8)
 
-# إعداد اتصال آمن لتخطي أي مشاكل في شهادات SSL للروابط الوسيطة
-ssl_unverified = ssl.create_default_context()
-ssl_unverified.check_hostname = False
-ssl_unverified.verify_mode = ssl.CERT_NONE
+# ربط الطلبات بمعرف رسالة الأزرار الخاصة بها منعاً لتداخل الجلسات
+active_requests = {}
 
-def download_file_stream(source_url, output_path):
-    """تنزيل محتوى الرابط مباشرة وحفظه كملف mp4"""
+ALLOWED_DOMAINS = ("tiktok.com", "instagram.com", "youtube.com", "youtu.be")
+
+def is_safe_supported_url(url_text):
+    """التحقق الأمني الدقيق من النطاق وتفادي ثغرات التوجيه"""
+    try:
+        parsed = urllib.parse.urlparse(url_text)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = (parsed.hostname or "").lower()
+        return any(host == domain or host.endswith("." + domain) for domain in ALLOWED_DOMAINS)
+    except Exception:
+        return False
+
+def fetch_tiktok_payload(url):
+    """جلب بيانات تيك توك مع ترميز الرابط بالكامل"""
+    encoded_url = urllib.parse.quote(url, safe='')
+    api_endpoint = f"https://www.tikwm.com/api/?url={encoded_url}"
+    req = urllib.request.Request(
+        api_endpoint,
+        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode('utf-8'))
+        if data.get("code") == 0:
+            return data.get("data")
+    return None
+
+def download_raw_stream(source_url, destination_path):
+    """تنزيل البث المباشر وتخزينه في مسار آمن"""
     req = urllib.request.Request(
         source_url,
         headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     )
-    with urllib.request.urlopen(req, timeout=30, context=ssl_unverified) as resp, open(output_path, 'wb') as f:
+    with urllib.request.urlopen(req, timeout=30) as resp, open(destination_path, 'wb') as out_file:
         while True:
             chunk = resp.read(1024 * 64)
             if not chunk:
                 break
-            f.write(chunk)
-
-def get_tiktok_info(url):
-    """جلب بيانات تيك توك وتخطي الحظر"""
-    api_url = f"https://www.tikwm.com/api/?url={url}"
-    req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
-        if data.get("code") == 0:
-            return data["data"]
-    return None
-
-def get_instagram_stream(url):
-    """استخراج رابط فيديو إنستغرام عبر بوابات فك التقييد"""
-    match = re.search(r'instagram\.com/(?:[a-zA-Z0-9_\.]+/)?(reel|p|tv)/([A-Za-z0-9_-]+)', url)
-    if not match:
-        return None
-    
-    media_type = match.group(1)
-    shortcode = match.group(2)
-    path = f"/{media_type}/{shortcode}/"
-    
-    gateways = [
-        f"https://ddinstagram.com{path}",
-        f"https://kkinstagram.com{path}",
-        f"https://instafix.app{path}"
-    ]
-
-    for target_url in gateways:
-        try:
-            req = urllib.request.Request(
-                target_url,
-                headers={'User-Agent': 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)'}
-            )
-            with urllib.request.urlopen(req, timeout=12, context=ssl_unverified) as resp:
-                html = resp.read().decode('utf-8', errors='ignore')
-                
-                video_match = re.search(r'<meta\s+property=["\']og:video(?::secure_url)?["\']\s+content=["\']([^"\']+)["\']', html)
-                if not video_match:
-                    video_match = re.search(r'<meta\s+(?:name|property)=["\']twitter:player:stream["\']\s+content=["\']([^"\']+)["\']', html)
-                if not video_match:
-                    video_match = re.search(r'<video[^>]+src=["\']([^"\']+)["\']', html)
-                
-                if video_match:
-                    direct_url = video_match.group(1).replace("&amp;", "&")
-                    if direct_url.startswith("http"):
-                        return direct_url
-        except Exception:
-            continue
-
-    try:
-        ydl_opts_ig = {'quiet': True, 'no_warnings': True, 'skip_download': True}
-        with yt_dlp.YoutubeDL(ydl_opts_ig) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if 'url' in info:
-                return info['url']
-    except Exception:
-        pass
-
-    return None
+            out_file.write(chunk)
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     bot.reply_to(
         message,
         "مرحباً بك! 👋\n"
-        "أرسل لي أي رابط من YouTube أو TikTok أو Instagram وسأقوم بعرض خيارات التحميل المناسبة فوراً."
+        "أرسل لي أي رابط من YouTube أو TikTok أو Instagram وسأقوم بتوفير خيارات التحميل المناسبة بشكل آمن ومستقل."
     )
 
 @bot.message_handler(func=lambda msg: True)
-def handle_incoming_link(message):
+def handle_link_submission(message):
     url = message.text.strip()
-    valid_domains = ["tiktok.com", "instagram.com", "youtube.com", "youtu.be"]
     
-    if not any(domain in url for domain in valid_domains):
-        bot.reply_to(message, "يرجى إرسال رابط صالح من YouTube أو TikTok أو Instagram.")
+    if not is_safe_supported_url(url):
+        bot.reply_to(message, "يرجى إرسال رابط صالح ومعتمد من YouTube أو TikTok أو Instagram فقط.")
         return
 
-    chat_id = message.chat.id
-    user_links[chat_id] = url
-
-    # إنشاء الأزرار عمودياً فوق بعضها (row_width=1)
     markup = types.InlineKeyboardMarkup(row_width=1)
     btn_high = types.InlineKeyboardButton("🎬 دقة عالية (أعلى جودة متوفرة)", callback_data="q_high")
     btn_low = types.InlineKeyboardButton("📱 دقة منخفضة (360p)", callback_data="q_low")
-    btn_audio = types.InlineKeyboardButton("🎵 صوت فقط (.mp4)", callback_data="q_audio")
-    
+    btn_audio = types.InlineKeyboardButton("🎵 استخراج الصوت (.mp4)", callback_data="q_audio")
     markup.add(btn_high, btn_low, btn_audio)
 
-    bot.reply_to(message, "اختر ما ترغب بتحميله:", reply_markup=markup)
+    prompt = bot.reply_to(message, "اختر ما ترغب بتحميله:", reply_markup=markup)
+    
+    # حفظ الرابط بالارتباط مع معرّف رسالة الأزرار حصراً
+    active_requests[prompt.message_id] = url
 
 @bot.callback_query_handler(func=lambda call: call.data in ["q_high", "q_low", "q_audio"])
-def handle_download_choice(call):
+def execute_download_flow(call):
     chat_id = call.message.chat.id
-    url = user_links.get(chat_id)
+    target_msg_id = call.message.message_id
+    url = active_requests.get(target_msg_id)
 
     if not url:
-        bot.answer_callback_query(call.id, "انتهت صلاحية الطلب، يرجى إعادة إرسال الرابط.")
+        bot.answer_callback_query(call.id, "انتهت صلاحية هذا الطلب، أرسل الرابط مرة أخرى.")
         return
 
     bot.answer_callback_query(call.id)
     choice = call.data
-    status = bot.edit_message_text("جاري جلب المحتوى وتجهيزه، انتظر لحظات... ⏳", chat_id=chat_id, message_id=call.message.message_id)
-    output_file = f"media_{chat_id}.mp4"
+    status = bot.edit_message_text(
+        "جاري فحص وتجهيز الملف بأمان، يرجى الانتظار... ⏳",
+        chat_id=chat_id,
+        message_id=target_msg_id
+    )
 
-    try:
-        # 1. منصة تيك توك
-        if "tiktok.com" in url:
-            data = get_tiktok_info(url)
-            if data:
-                if choice == "q_high":
-                    src = data.get("hdplay") or data.get("play")
-                    download_file_stream(src, output_file)
-                    with open(output_file, 'rb') as f:
-                        bot.send_video(chat_id, f, caption="تم تحميل مقطع TikTok بأعلى دقة 🎬")
-                elif choice == "q_low":
-                    src = data.get("play")
-                    download_file_stream(src, output_file)
-                    with open(output_file, 'rb') as f:
-                        bot.send_video(chat_id, f, caption="تم تحميل مقطع TikTok بدقة عادية 📱")
-                else:
-                    src = data.get("music") or data.get("play")
-                    download_file_stream(src, output_file)
-                    with open(output_file, 'rb') as f:
-                        bot.send_audio(chat_id, f, caption="تم استخراج الصوت بصيغة .mp4 بنجاح 🎵")
-                
-                if os.path.exists(output_file):
-                    os.remove(output_file)
-                bot.delete_message(chat_id, status.message_id)
-                return
+    # عزل مسار التنزيل داخل مجلد مؤقت فريد يُمحى بالكامل عند الانتهاء
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_file = os.path.join(temp_dir, "media.mp4")
 
-        # 2. منصة إنستغرام
-        if "instagram.com" in url:
-            video_url = get_instagram_stream(url)
-            if video_url:
-                download_file_stream(video_url, output_file)
+        try:
+            # 1. تيك توك
+            if "tiktok.com" in url:
+                data = fetch_tiktok_payload(url)
+                if data:
+                    if choice == "q_audio":
+                        src = data.get("music") or data.get("play")
+                        download_raw_stream(src, output_file)
+                        with open(output_file, 'rb') as f:
+                            bot.send_audio(chat_id, f, caption="تم استخراج الصوت بنجاح 🎵")
+                    elif choice == "q_low":
+                        src = data.get("play")
+                        download_raw_stream(src, output_file)
+                        with open(output_file, 'rb') as f:
+                            bot.send_video(chat_id, f, caption="تم تحميل مقطع TikTok بدقة عادية 📱")
+                    else:
+                        src = data.get("hdplay") or data.get("play")
+                        download_raw_stream(src, output_file)
+                        with open(output_file, 'rb') as f:
+                            bot.send_video(chat_id, f, caption="تم تحميل مقطع TikTok بأعلى دقة 🎬")
+
+                    bot.delete_message(chat_id, status.message_id)
+                    active_requests.pop(target_msg_id, None)
+                    return
+
+            # 2. يوتيوب وإنستغرام عبر المحرك الأساسي yt-dlp
+            ydl_base_opts = {
+                'noplaylist': True,
+                'quiet': True,
+                'no_warnings': True,
+            }
+
+            # فحص حجم المقطع ومعلوماته مسبقاً قبل الشروع بالتنزيل
+            with yt_dlp.YoutubeDL(ydl_base_opts) as ydl_inspect:
+                meta = ydl_inspect.extract_info(url, download=False)
+                size_est = meta.get('filesize') or meta.get('filesize_approx') or 0
+                if size_est > 50 * 1024 * 1024:
+                    bot.edit_message_text(
+                        "تعذر التحميل: حجم الملف يتجاوز الحد الأقصى المسموح به في تيليجرام (50MB).",
+                        chat_id=chat_id,
+                        message_id=status.message_id
+                    )
+                    active_requests.pop(target_msg_id, None)
+                    return
+
+            # إعداد مسار وقواعد الجودة
+            ydl_download_opts = dict(ydl_base_opts)
+            ydl_download_opts['outtmpl'] = os.path.join(temp_dir, 'source.%(ext)s')
+
+            if choice == "q_audio":
+                ydl_download_opts['format'] = 'bestaudio[ext=m4a]/bestaudio/best'
+            elif choice == "q_low":
+                ydl_download_opts['format'] = 'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360]/best'
+            else:
+                ydl_download_opts['format'] = 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best'
+
+            with yt_dlp.YoutubeDL(ydl_download_opts) as ydl_exec:
+                info = ydl_exec.extract_info(url, download=True)
+                downloaded_file = ydl_exec.prepare_filename(info)
+
+            # ضمان إرسال الامتداد بصيغة mp4 المقروءة
+            if downloaded_file and os.path.exists(downloaded_file):
+                os.replace(downloaded_file, output_file)
+
                 with open(output_file, 'rb') as f:
                     if choice == "q_audio":
                         bot.send_audio(chat_id, f, caption="تم استخراج الصوت بصيغة .mp4 بنجاح 🎵")
                     elif choice == "q_low":
-                        bot.send_video(chat_id, f, caption="تم تحميل مقطع Instagram بدقة منخفضة 📱")
+                        bot.send_video(chat_id, f, caption="تم التحميل بدقة 360p 📱")
                     else:
-                        bot.send_video(chat_id, f, caption="تم تحميل مقطع Instagram بأعلى جودة 🎬")
-                
-                if os.path.exists(output_file):
-                    os.remove(output_file)
+                        bot.send_video(chat_id, f, caption="تم التحميل بأعلى جودة متوفرة 🎬")
+
                 bot.delete_message(chat_id, status.message_id)
-                return
+                active_requests.pop(target_msg_id, None)
+            else:
+                bot.edit_message_text("تعذر العثور على الملف بعد المعالجة.", chat_id=chat_id, message_id=status.message_id)
 
-        # 3. منصة يوتيوب
-        temp_file = f"temp_{chat_id}.%(ext)s"
-
-        if choice == "q_audio":
-            format_rule = "bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/best"
-        elif choice == "q_low":
-            format_rule = "best[height<=360][ext=mp4]/best[height<=360]/best"
-        else:
-            format_rule = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
-
-        ydl_opts = {
-            'format': format_rule,
-            'outtmpl': temp_file,
-            'max_filesize': 50 * 1024 * 1024,
-            'quiet': True,
-            'no_warnings': True
-        }
-
-        temp_downloaded = None
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            temp_downloaded = ydl.prepare_filename(info)
-
-        if temp_downloaded and os.path.exists(temp_downloaded):
-            if os.path.exists(output_file):
-                os.remove(output_file)
-            os.replace(temp_downloaded, output_file)
-
-            with open(output_file, 'rb') as f:
-                if choice == "q_audio":
-                    bot.send_audio(chat_id, f, caption="تم استخراج الصوت بصيغة .mp4 بنجاح 🎵")
-                elif choice == "q_low":
-                    bot.send_video(chat_id, f, caption="تم تحميل الفيديو بدقة 360p 📱")
-                else:
-                    bot.send_video(chat_id, f, caption="تم تحميل الفيديو بأعلى جودة متوفرة 🎬")
-
-            if os.path.exists(output_file):
-                os.remove(output_file)
-            bot.delete_message(chat_id, status.message_id)
-        else:
-            bot.edit_message_text("تعذر العثور على الملف بعد المعالجة.", chat_id=chat_id, message_id=status.message_id)
-
-    except Exception as e:
-        if os.path.exists(output_file):
-            os.remove(output_file)
-        print(f"Download error: {e}")
-        bot.edit_message_text("تعذر تحميل المحتوى؛ قد يتجاوز حجم المقطع حد 50MB المسموح به أو يكون مقيداً.", chat_id=chat_id, message_id=status.message_id)
+        except Exception as err:
+            print(f"Operational error: {err}")
+            bot.edit_message_text(
+                "تعذر استكمال التحميل؛ قد يكون المحتوى مقيداً أو خاصاً أو تجاوز حجمه 50MB.",
+                chat_id=chat_id,
+                message_id=status.message_id
+            )
+            active_requests.pop(target_msg_id, None)
 
 print("Bot is starting...")
 bot.infinity_polling()
