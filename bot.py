@@ -1,5 +1,6 @@
 import os
 import re
+import ssl
 import json
 import urllib.request
 import telebot
@@ -20,7 +21,12 @@ if not TOKEN:
     raise ValueError("لم يتم العثور على BOT_TOKEN، تأكد من ضبطه في إعدادات السيرفر.")
 
 bot = telebot.TeleBot(TOKEN)
-user_sessions = {}
+user_links = {}
+
+# إعداد اتصال آمن لتخطي أي مشاكل في شهادات SSL للروابط الوسيطة
+ssl_unverified = ssl.create_default_context()
+ssl_unverified.check_hostname = False
+ssl_unverified.verify_mode = ssl.CERT_NONE
 
 def download_file_stream(source_url, output_path):
     """تنزيل محتوى الرابط مباشرة وحفظه كملف mp4"""
@@ -28,7 +34,7 @@ def download_file_stream(source_url, output_path):
         source_url,
         headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     )
-    with urllib.request.urlopen(req, timeout=30) as resp, open(output_path, 'wb') as f:
+    with urllib.request.urlopen(req, timeout=30, context=ssl_unverified) as resp, open(output_path, 'wb') as f:
         while True:
             chunk = resp.read(1024 * 64)
             if not chunk:
@@ -36,7 +42,7 @@ def download_file_stream(source_url, output_path):
             f.write(chunk)
 
 def get_tiktok_info(url):
-    """فحص روابط تيك توك وجلب الجودات المتوفرة"""
+    """جلب بيانات تيك توك وتخطي الحظر"""
     api_url = f"https://www.tikwm.com/api/?url={url}"
     req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(req, timeout=15) as resp:
@@ -46,27 +52,52 @@ def get_tiktok_info(url):
     return None
 
 def get_instagram_stream(url):
-    """استخراج رابط الفيديو المتاح من إنستغرام عبر بوابات فك الحظر"""
-    clean_url = url.split("?")[0]
-    gateways = ["ddinstagram.com", "instafix.app"]
+    """استخراج رابط فيديو إنستغرام عبر بوابات فك التقييد"""
+    match = re.search(r'instagram\.com/(?:[a-zA-Z0-9_\.]+/)?(reel|p|tv)/([A-Za-z0-9_-]+)', url)
+    if not match:
+        return None
     
-    for gw in gateways:
+    media_type = match.group(1)
+    shortcode = match.group(2)
+    path = f"/{media_type}/{shortcode}/"
+    
+    gateways = [
+        f"https://ddinstagram.com{path}",
+        f"https://kkinstagram.com{path}",
+        f"https://instafix.app{path}"
+    ]
+
+    for target_url in gateways:
         try:
-            parts = clean_url.split("instagram.com")
-            proxy_url = parts[0] + gw + parts[1]
             req = urllib.request.Request(
-                proxy_url,
-                headers={'User-Agent': 'TelegramBot (like TwitterBot)'}
+                target_url,
+                headers={'User-Agent': 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)'}
             )
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=12, context=ssl_unverified) as resp:
                 html = resp.read().decode('utf-8', errors='ignore')
-                match = re.search(r'<meta\s+property=["\']og:video["\']\s+content=["\']([^"\']+)["\']', html)
-                if not match:
-                    match = re.search(r'<meta\s+name=["\']twitter:player:stream["\']\s+content=["\']([^"\']+)["\']', html)
-                if match:
-                    return match.group(1).replace("&amp;", "&")
+                
+                video_match = re.search(r'<meta\s+property=["\']og:video(?::secure_url)?["\']\s+content=["\']([^"\']+)["\']', html)
+                if not video_match:
+                    video_match = re.search(r'<meta\s+(?:name|property)=["\']twitter:player:stream["\']\s+content=["\']([^"\']+)["\']', html)
+                if not video_match:
+                    video_match = re.search(r'<video[^>]+src=["\']([^"\']+)["\']', html)
+                
+                if video_match:
+                    direct_url = video_match.group(1).replace("&amp;", "&")
+                    if direct_url.startswith("http"):
+                        return direct_url
         except Exception:
             continue
+
+    try:
+        ydl_opts_ig = {'quiet': True, 'no_warnings': True, 'skip_download': True}
+        with yt_dlp.YoutubeDL(ydl_opts_ig) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if 'url' in info:
+                return info['url']
+    except Exception:
+        pass
+
     return None
 
 @bot.message_handler(commands=['start', 'help'])
@@ -74,12 +105,11 @@ def send_welcome(message):
     bot.reply_to(
         message,
         "مرحباً بك! 👋\n"
-        "أرسل لي أي رابط من YouTube أو TikTok أو Instagram.\n"
-        "سأقوم بفحص الفيديو وعرض خيارات الدقة المتوفرة فعلياً في المصدر لتحميلها، أو استخراج الصوت بصيغة .mp4."
+        "أرسل لي أي رابط من YouTube أو TikTok أو Instagram وسأقوم بعرض خيارات التحميل المناسبة فوراً."
     )
 
 @bot.message_handler(func=lambda msg: True)
-def analyze_and_prompt(message):
+def handle_incoming_link(message):
     url = message.text.strip()
     valid_domains = ["tiktok.com", "instagram.com", "youtube.com", "youtu.be"]
     
@@ -87,156 +117,124 @@ def analyze_and_prompt(message):
         bot.reply_to(message, "يرجى إرسال رابط صالح من YouTube أو TikTok أو Instagram.")
         return
 
-    checking_msg = bot.reply_to(message, "جاري فحص الجودات المتاحة للمقطع... 🔍")
     chat_id = message.chat.id
-    markup = types.InlineKeyboardMarkup(row_width=2)
+    user_links[chat_id] = url
 
-    # 1. فحص مقاطع تيك توك
-    if "tiktok.com" in url:
-        try:
-            data = get_tiktok_info(url)
-            if data:
-                user_sessions[chat_id] = {'type': 'tiktok', 'data': data}
-                buttons = []
-                if data.get("hdplay"):
-                    buttons.append(types.InlineKeyboardButton("🎬 دقة عالية (HD)", callback_data="tt_hd"))
-                    buttons.append(types.InlineKeyboardButton("📱 دقة عادية (SD)", callback_data="tt_sd"))
-                else:
-                    buttons.append(types.InlineKeyboardButton("🎬 تحميل الفيديو", callback_data="tt_sd"))
-                buttons.append(types.InlineKeyboardButton("🎵 صوت فقط (.mp4)", callback_data="tt_audio"))
-                markup.add(*buttons)
-                bot.edit_message_text("الجودات المتوفرة لمقطع TikTok:", chat_id=chat_id, message_id=checking_msg.message_id, reply_markup=markup)
-                return
-        except Exception as e:
-            print(f"TikTok inspect error: {e}")
+    # إنشاء الأزرار عمودياً فوق بعضها (row_width=1)
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    btn_high = types.InlineKeyboardButton("🎬 دقة عالية (أعلى جودة متوفرة)", callback_data="q_high")
+    btn_low = types.InlineKeyboardButton("📱 دقة منخفضة (360p)", callback_data="q_low")
+    btn_audio = types.InlineKeyboardButton("🎵 صوت فقط (.mp4)", callback_data="q_audio")
+    
+    markup.add(btn_high, btn_low, btn_audio)
 
-    # 2. فحص مقاطع إنستغرام
-    elif "instagram.com" in url:
-        try:
-            video_url = get_instagram_stream(url)
-            if video_url:
-                user_sessions[chat_id] = {'type': 'instagram', 'url': video_url}
-                btn_vid = types.InlineKeyboardButton("🎬 تحميل الفيديو (الجودة الأصلية)", callback_data="ig_video")
-                btn_aud = types.InlineKeyboardButton("🎵 صوت فقط (.mp4)", callback_data="ig_audio")
-                markup.add(btn_vid, btn_aud)
-                bot.edit_message_text("الخيارات المتاحة لمقطع Instagram:", chat_id=chat_id, message_id=checking_msg.message_id, reply_markup=markup)
-                return
-        except Exception as e:
-            print(f"Instagram inspect error: {e}")
+    bot.reply_to(message, "اختر ما ترغب بتحميله:", reply_markup=markup)
 
-    # 3. فحص مقاطع يوتيوب
-    else:
-        try:
-            ydl_opts_info = {'quiet': True, 'no_warnings': True, 'skip_download': True}
-            with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
-                info = ydl.extract_info(url, download=False)
-
-            available_heights = set()
-            for f in info.get('formats', []):
-                h = f.get('height')
-                if h and f.get('vcodec') != 'none' and h <= 1080:
-                    available_heights.add(h)
-
-            standard_tiers = [1080, 720, 480, 360, 240]
-            matched_tiers = [tier for tier in standard_tiers if any(abs(tier - h) <= 25 for h in available_heights)]
-
-            if not matched_tiers:
-                matched_tiers = sorted(list(available_heights), reverse=True)[:3]
-
-            user_sessions[chat_id] = {'type': 'youtube', 'url': url}
-            buttons = [types.InlineKeyboardButton(f"📺 دقة {tier}p", callback_data=f"yt_{tier}") for tier in matched_tiers]
-            buttons.append(types.InlineKeyboardButton("🎵 صوت فقط (.mp4)", callback_data="yt_audio"))
-            markup.add(*buttons)
-            bot.edit_message_text(f"الجودات المتوفرة لفيديو YouTube:\n({info.get('title', 'فيديو')[:50]})", chat_id=chat_id, message_id=checking_msg.message_id, reply_markup=markup)
-            return
-        except Exception as e:
-            print(f"YouTube inspect error: {e}")
-
-    bot.edit_message_text("تعذر قراءة الجودات المتوفرة للمقطع؛ قد يكون خاصاً أو مقيداً.", chat_id=chat_id, message_id=checking_msg.message_id)
-
-@bot.callback_query_handler(func=lambda call: True)
-def process_download(call):
+@bot.callback_query_handler(func=lambda call: call.data in ["q_high", "q_low", "q_audio"])
+def handle_download_choice(call):
     chat_id = call.message.chat.id
-    session = user_sessions.get(chat_id)
+    url = user_links.get(chat_id)
 
-    if not session:
-        bot.answer_callback_query(call.id, "انتهت صلاحية الطلب، أرسل الرابط مرة أخرى.")
+    if not url:
+        bot.answer_callback_query(call.id, "انتهت صلاحية الطلب، يرجى إعادة إرسال الرابط.")
         return
 
     bot.answer_callback_query(call.id)
     choice = call.data
-    status = bot.edit_message_text("جاري تنزيل المحتوى ومعالجته... ⏳", chat_id=chat_id, message_id=call.message.message_id)
+    status = bot.edit_message_text("جاري جلب المحتوى وتجهيزه، انتظر لحظات... ⏳", chat_id=chat_id, message_id=call.message.message_id)
     output_file = f"media_{chat_id}.mp4"
 
     try:
-        # معالجة TikTok
-        if session['type'] == 'tiktok':
-            data = session['data']
-            if choice == "tt_hd":
-                src = data.get("hdplay") or data.get("play")
-            elif choice == "tt_sd":
-                src = data.get("play")
-            else:
-                src = data.get("music") or data.get("play")
-
-            download_file_stream(src, output_file)
-            with open(output_file, 'rb') as f:
-                if choice == "tt_audio":
-                    bot.send_audio(chat_id, f, caption="تم استخراج الصوت بصيغة .mp4 بنجاح 🎵")
+        # 1. منصة تيك توك
+        if "tiktok.com" in url:
+            data = get_tiktok_info(url)
+            if data:
+                if choice == "q_high":
+                    src = data.get("hdplay") or data.get("play")
+                    download_file_stream(src, output_file)
+                    with open(output_file, 'rb') as f:
+                        bot.send_video(chat_id, f, caption="تم تحميل مقطع TikTok بأعلى دقة 🎬")
+                elif choice == "q_low":
+                    src = data.get("play")
+                    download_file_stream(src, output_file)
+                    with open(output_file, 'rb') as f:
+                        bot.send_video(chat_id, f, caption="تم تحميل مقطع TikTok بدقة عادية 📱")
                 else:
-                    bot.send_video(chat_id, f, caption="تم التحميل بنجاح 🎬")
-
-        # معالجة Instagram
-        elif session['type'] == 'instagram':
-            download_file_stream(session['url'], output_file)
-            with open(output_file, 'rb') as f:
-                if choice == "ig_audio":
-                    bot.send_audio(chat_id, f, caption="تم استخراج الصوت بصيغة .mp4 بنجاح 🎵")
-                else:
-                    bot.send_video(chat_id, f, caption="تم التحميل بنجاح 🎬")
-
-        # معالجة YouTube
-        elif session['type'] == 'youtube':
-            url = session['url']
-            temp_file = f"temp_{chat_id}.%(ext)s"
-            
-            if choice == "yt_audio":
-                format_rule = "bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/best"
-            else:
-                target_h = choice.split("_")[1]
-                format_rule = f"bestvideo[height<={target_h}][ext=mp4]+bestaudio[ext=m4a]/best[height<={target_h}][ext=mp4]/best[height<={target_h}]/best"
-
-            ydl_opts = {
-                'format': format_rule,
-                'outtmpl': temp_file,
-                'max_filesize': 50 * 1024 * 1024,
-                'quiet': True,
-                'no_warnings': True
-            }
-
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                downloaded_name = ydl.prepare_filename(info)
-
-            if os.path.exists(downloaded_name):
+                    src = data.get("music") or data.get("play")
+                    download_file_stream(src, output_file)
+                    with open(output_file, 'rb') as f:
+                        bot.send_audio(chat_id, f, caption="تم استخراج الصوت بصيغة .mp4 بنجاح 🎵")
+                
                 if os.path.exists(output_file):
                     os.remove(output_file)
-                os.replace(downloaded_name, output_file)
-                with open(output_file, 'rb') as f:
-                    if choice == "yt_audio":
-                        bot.send_audio(chat_id, f, caption="تم استخراج الصوت بصيغة .mp4 بنجاح 🎵")
-                    else:
-                        bot.send_video(chat_id, f, caption="تم التحميل بنجاح 🎬")
+                bot.delete_message(chat_id, status.message_id)
+                return
 
-        if os.path.exists(output_file):
-            os.remove(output_file)
-        bot.delete_message(chat_id, status.message_id)
+        # 2. منصة إنستغرام
+        if "instagram.com" in url:
+            video_url = get_instagram_stream(url)
+            if video_url:
+                download_file_stream(video_url, output_file)
+                with open(output_file, 'rb') as f:
+                    if choice == "q_audio":
+                        bot.send_audio(chat_id, f, caption="تم استخراج الصوت بصيغة .mp4 بنجاح 🎵")
+                    elif choice == "q_low":
+                        bot.send_video(chat_id, f, caption="تم تحميل مقطع Instagram بدقة منخفضة 📱")
+                    else:
+                        bot.send_video(chat_id, f, caption="تم تحميل مقطع Instagram بأعلى جودة 🎬")
+                
+                if os.path.exists(output_file):
+                    os.remove(output_file)
+                bot.delete_message(chat_id, status.message_id)
+                return
+
+        # 3. منصة يوتيوب
+        temp_file = f"temp_{chat_id}.%(ext)s"
+
+        if choice == "q_audio":
+            format_rule = "bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/best"
+        elif choice == "q_low":
+            format_rule = "best[height<=360][ext=mp4]/best[height<=360]/best"
+        else:
+            format_rule = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+
+        ydl_opts = {
+            'format': format_rule,
+            'outtmpl': temp_file,
+            'max_filesize': 50 * 1024 * 1024,
+            'quiet': True,
+            'no_warnings': True
+        }
+
+        temp_downloaded = None
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            temp_downloaded = ydl.prepare_filename(info)
+
+        if temp_downloaded and os.path.exists(temp_downloaded):
+            if os.path.exists(output_file):
+                os.remove(output_file)
+            os.replace(temp_downloaded, output_file)
+
+            with open(output_file, 'rb') as f:
+                if choice == "q_audio":
+                    bot.send_audio(chat_id, f, caption="تم استخراج الصوت بصيغة .mp4 بنجاح 🎵")
+                elif choice == "q_low":
+                    bot.send_video(chat_id, f, caption="تم تحميل الفيديو بدقة 360p 📱")
+                else:
+                    bot.send_video(chat_id, f, caption="تم تحميل الفيديو بأعلى جودة متوفرة 🎬")
+
+            if os.path.exists(output_file):
+                os.remove(output_file)
+            bot.delete_message(chat_id, status.message_id)
+        else:
+            bot.edit_message_text("تعذر العثور على الملف بعد المعالجة.", chat_id=chat_id, message_id=status.message_id)
 
     except Exception as e:
         if os.path.exists(output_file):
             os.remove(output_file)
-        print(f"Error during send: {e}")
-        bot.edit_message_text("تعذر استكمال التحميل؛ قد يتجاوز حجم الملف حد 50MB المسموح به في تيليجرام.", chat_id=chat_id, message_id=status.message_id)
+        print(f"Download error: {e}")
+        bot.edit_message_text("تعذر تحميل المحتوى؛ قد يتجاوز حجم المقطع حد 50MB المسموح به أو يكون مقيداً.", chat_id=chat_id, message_id=status.message_id)
 
 print("Bot is starting...")
 bot.infinity_polling()
