@@ -3,7 +3,19 @@ import telebot
 from telebot import types
 import yt_dlp
 
+# قراءة المتغيرات من ملف .env الخاص بالاستضافة تلقائياً
+if os.path.exists(".env"):
+    with open(".env", "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, val = line.split("=", 1)
+                os.environ[key.strip()] = val.strip().strip('"').strip("'")
+
 TOKEN = os.environ.get("BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("لم يتم العثور على BOT_TOKEN، تأكد من إضافته في إعدادات السيرفر.")
+
 bot = telebot.TeleBot(TOKEN)
 
 # تخزين الرابط مؤقتاً لكل محادثة
@@ -44,7 +56,7 @@ def handle_incoming_link(message):
     user_links[message.chat.id] = url
     platform = get_platform_name(url)
 
-    # إنشاء لوحة أزرار تفاعلية (Inline Keyboard)
+    # إنشاء لوحة أزرار تفاعلية
     markup = types.InlineKeyboardMarkup(row_width=2)
     btn_best = types.InlineKeyboardButton("🎬 أعلى دقة", callback_data="q_best")
     btn_720 = types.InlineKeyboardButton("📺 دقة 720p", callback_data="q_720")
@@ -72,7 +84,6 @@ def process_quality_choice(call):
     bot.answer_callback_query(call.id)
     choice = call.data
 
-    # إظهار رسالة تفيد ببدء المعالجة والتحميل
     status_msg = bot.edit_message_text(
         "جاري جلب الملف وتجهيزه، يرجى الانتظار قليلاً... ⏳",
         chat_id=chat_id,
@@ -81,7 +92,6 @@ def process_quality_choice(call):
 
     is_audio = (choice == "q_audio")
 
-    # تحديد إعدادات الصيغة بحسب خيار المستخدم
     if choice == "q_best":
         format_str = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
         outtmpl = f"video_{chat_id}_best.%(ext)s"
@@ -91,14 +101,14 @@ def process_quality_choice(call):
     elif choice == "q_360":
         format_str = "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best[height<=360]/best"
         outtmpl = f"video_{chat_id}_360.%(ext)s"
-    else:  # صوت فقط
+    else:
         format_str = "bestaudio[ext=m4a]/bestaudio/best"
         outtmpl = f"audio_{chat_id}.%(ext)s"
 
     ydl_opts = {
         'format': format_str,
         'outtmpl': outtmpl,
-        'max_filesize': 50 * 1024 * 1024,  # الحد الأقصى لحجم ملف البوت في تيليجرام 50MB
+        'max_filesize': 50 * 1024 * 1024,
         'quiet': True,
         'no_warnings': True,
     }
@@ -110,7 +120,6 @@ def process_quality_choice(call):
             info = ydl.extract_info(url, download=True)
             downloaded_file = ydl.prepare_filename(info)
 
-        # التحقق من وجود الملف ورفعه إلى تيليجرام
         if downloaded_file and os.path.exists(downloaded_file):
             with open(downloaded_file, 'rb') as media_file:
                 if is_audio:
@@ -125,7 +134,6 @@ def process_quality_choice(call):
                         media_file,
                         caption="تم تحميل الفيديو بنجاح 🎬"
                     )
-            # حذف الملف بعد الإرسال لتوفير مساحة التخزين في السيرفر
             os.remove(downloaded_file)
             bot.delete_message(chat_id, status_msg.message_id)
         else:
@@ -136,7 +144,6 @@ def process_quality_choice(call):
             )
 
     except Exception:
-        # حذف الملف إن كان قد بدأ التحميل لعدم استهلاك مساحة السيرفر
         if downloaded_file and os.path.exists(downloaded_file):
             try:
                 os.remove(downloaded_file)
